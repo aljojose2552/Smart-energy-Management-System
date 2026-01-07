@@ -6,38 +6,36 @@ from pathlib import Path
 from io import BytesIO
 import plotly.express as px
 
-# -----------------------------
 # App config
-# -----------------------------
-st.set_page_config(layout="wide", page_title="Smart Energy Management: Clustering + Simulation")
-st.title("🏡 Smart Energy Management: Clustering + Demand Response Simulation")
+
+st.set_page_config(layout="wide", page_title="Smart Energy: Clustering + Simulation + Solar Patterns")
+st.title(" Smart Energy Management: Clustering + Demand Response + Solar Patterns")
 
 DATE_COL = "date"
 HOUSEHOLD_COL = "household"
 CONS_COL = "Consumption(Wh)"
+PROD_COL = "Production(Wh)"
 GRID_COL = "From grid(Wh)"
 
-# Peak window for feature engineering (match your training logic)
 EVENING_START = 17
 EVENING_END = 23
 
-# Model artifacts
 MODEL_DIR = Path("household_clustering_model")
 KMEANS_PATH = MODEL_DIR / "kmeans_model.pkl"
 SCALER_PATH = MODEL_DIR / "scaler.pkl"
 FEATURES_PATH = MODEL_DIR / "feature_columns.pkl"
 
-# Optional: change these after you interpret clusters
+
+
 CLUSTER_LABELS = {
-    0: "Cluster 0",
-    1: "Cluster 1",
-    2: "Cluster 2",
-    3: "Cluster 3",
+    0: "Solar-Efficient Low-Demand Households",
+    1: "Evening-Peak Grid-Dependent Households",
+    2: "High-Consumption Solar-Prosumers"
 }
 
-# -----------------------------
+
 # Helpers
-# -----------------------------
+
 def strip_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.str.strip()
@@ -67,26 +65,37 @@ def load_artifacts():
 
 def build_features_for_clustering(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Must match your notebook training feature engineering.
-    Expects at least: date, Consumption(Wh). Optional: household.
+    Solar-aware feature engineering.
+    IMPORTANT: must match your notebook training.
+    Required cols for FULL solar model: date, Consumption(Wh), Production(Wh), From grid(Wh)
+    household optional (will be set to NEW_HOUSEHOLD if missing).
     """
     df = strip_cols(df)
+
     if HOUSEHOLD_COL not in df.columns:
         df[HOUSEHOLD_COL] = "NEW_HOUSEHOLD"
+
+    # required baseline
+    missing_base = require_columns(df, [DATE_COL, CONS_COL])
+    if missing_base:
+        raise ValueError(f"Missing required columns: {missing_base}")
 
     df = ensure_datetime(df, DATE_COL)
     df = ensure_numeric_nonneg(df, CONS_COL)
 
+    # time features
     df["hour"] = df[DATE_COL].dt.hour
     df["weekday"] = df[DATE_COL].dt.weekday
     df["is_weekend"] = (df["weekday"] >= 5).astype(int)
 
+    # --- Consumption behavioural features
     feats = df.groupby(HOUSEHOLD_COL)[CONS_COL].agg(
         total_Wh="sum",
         mean_Wh="mean",
         peak_Wh="max",
         std_Wh="std"
     ).reset_index()
+    feats["std_Wh"] = feats["std_Wh"].fillna(0)
 
     evening = df[(df["hour"] >= EVENING_START) & (df["hour"] <= EVENING_END)] \
         .groupby(HOUSEHOLD_COL)[CONS_COL].sum().reset_index(name="evening_Wh")
@@ -100,23 +109,73 @@ def build_features_for_clustering(df: pd.DataFrame) -> pd.DataFrame:
     feats["weekend_Wh"] = feats["weekend_Wh"].fillna(0)
     feats["weekend_ratio"] = feats["weekend_Wh"] / (feats["total_Wh"] + 1e-9)
 
-    feats["std_Wh"] = feats["std_Wh"].fillna(0)
+    # --- Solar production pattern + utilisation (only if columns exist)
+    if PROD_COL in df.columns:
+        df = ensure_numeric_nonneg(df, PROD_COL)
+
+        prod = df.groupby(HOUSEHOLD_COL)[PROD_COL].agg(
+            prod_total_Wh="sum",
+            prod_mean_Wh="mean",
+            prod_peak_Wh="max",
+            prod_std_Wh="std",
+        ).reset_index()
+        prod["prod_std_Wh"] = prod["prod_std_Wh"].fillna(0)
+
+        midday = df[(df["hour"] >= 11) & (df["hour"] <= 15)] \
+            .groupby(HOUSEHOLD_COL)[PROD_COL].sum().reset_index(name="midday_prod_Wh")
+
+        prod = prod.merge(midday, on=HOUSEHOLD_COL, how="left")
+        prod["midday_prod_Wh"] = prod["midday_prod_Wh"].fillna(0)
+        prod["midday_prod_ratio"] = prod["midday_prod_Wh"] / (prod["prod_total_Wh"] + 1e-9)
+
+        feats = feats.merge(prod, on=HOUSEHOLD_COL, how="left")
+
+    if (PROD_COL in df.columns) and (GRID_COL in df.columns):
+        df = ensure_numeric_nonneg(df, GRID_COL)
+
+        df["solar_used_Wh"] = np.minimum(df[CONS_COL], df[PROD_COL])
+        solar = df.groupby(HOUSEHOLD_COL).agg(
+            total_consumption=(CONS_COL, "sum"),
+            total_production=(PROD_COL, "sum"),
+            grid_import=(GRID_COL, "sum"),
+            solar_used=("solar_used_Wh", "sum")
+        ).reset_index()
+
+        solar["solar_self_consumption_ratio"] = solar["solar_used"] / (solar["total_production"] + 1e-9)
+        solar["grid_dependency_ratio"] = solar["grid_import"] / (solar["total_consumption"] + 1e-9)
+
+        feats = feats.merge(
+            solar[[HOUSEHOLD_COL, "solar_self_consumption_ratio", "grid_dependency_ratio"]],
+            on=HOUSEHOLD_COL,
+            how="left"
+        )
+
+    # Fill any missing engineered cols with 0 (safe)
+    feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0)
     return feats
+
+def attach_cluster_to_timeseries(df_raw: pd.DataFrame, feats_with_cluster: pd.DataFrame) -> pd.DataFrame:
+    """Join predicted cluster back to row-level data for per-cluster pattern plots."""
+    df = strip_cols(df_raw)
+    if HOUSEHOLD_COL not in df.columns:
+        df[HOUSEHOLD_COL] = "NEW_HOUSEHOLD"
+    df = ensure_datetime(df, DATE_COL)
+
+    keep = feats_with_cluster[[HOUSEHOLD_COL, "cluster", "cluster_label"]].copy()
+    out = df.merge(keep, on=HOUSEHOLD_COL, how="left")
+    out["hour"] = out[DATE_COL].dt.hour
+    out["month"] = out[DATE_COL].dt.to_period("M").dt.to_timestamp()
+    return out
 
 @st.cache_data(show_spinner=False)
 def run_simulation(file_bytes: bytes, efficiency_measures: bool, demand_response: bool):
-    """
-    Demand-response simulation using uploaded CSV bytes.
-    Required cols: date, household, Consumption(Wh), From grid(Wh)
-    Returns: df_scaled, grid_summary_scaled, err
-    """
+    """Demand-response simulation using uploaded CSV bytes."""
     if not file_bytes:
         return None, None, "Uploaded file is empty (0 bytes)."
 
     df = pd.read_csv(BytesIO(file_bytes))
     df = strip_cols(df)
 
-    # Validate required columns
     required = [DATE_COL, HOUSEHOLD_COL, CONS_COL, GRID_COL]
     missing = require_columns(df, required)
     if missing:
@@ -125,15 +184,14 @@ def run_simulation(file_bytes: bytes, efficiency_measures: bool, demand_response
     df = ensure_datetime(df, DATE_COL)
     df = ensure_numeric_nonneg(df, CONS_COL)
     df = ensure_numeric_nonneg(df, GRID_COL)
-
     df["hour"] = df[DATE_COL].dt.hour
+
     df_scaled = df.copy()
 
-    # Efficiency (simple assumption): reduce grid import by 10%
+    # Efficiency: reduce grid import by 10%
     if efficiency_measures:
         df_scaled[GRID_COL] = df_scaled[GRID_COL] * 0.9
 
-    # Demand response: classify peak hours based on 75th percentile of average hourly consumption
     if demand_response:
         hourly_avg = df_scaled.groupby("hour")[CONS_COL].mean()
         threshold = hourly_avg.quantile(0.75)
@@ -141,7 +199,6 @@ def run_simulation(file_bytes: bytes, efficiency_measures: bool, demand_response
 
         df_scaled["demand_period"] = np.where(df_scaled["hour"].isin(peak_hours), "Peak", "Off-peak")
 
-        # Vectorized shifting: peak rows reduced to 80% / 70%, off-peak unchanged
         is_peak = (df_scaled["demand_period"] == "Peak")
         df_scaled["Adjusted_20%"] = df_scaled[GRID_COL] * np.where(is_peak, 0.8, 1.0)
         df_scaled["Adjusted_30%"] = df_scaled[GRID_COL] * np.where(is_peak, 0.7, 1.0)
@@ -150,8 +207,7 @@ def run_simulation(file_bytes: bytes, efficiency_measures: bool, demand_response
         df_scaled["Adjusted_20%"] = df_scaled[GRID_COL]
         df_scaled["Adjusted_30%"] = df_scaled[GRID_COL]
 
-    # Aggregate per household
-    grid_summary_scaled = df_scaled.groupby(HOUSEHOLD_COL).agg(
+    grid_summary = df_scaled.groupby(HOUSEHOLD_COL).agg(
         **{
             "Original Grid Use(Wh)": (GRID_COL, "sum"),
             "Grid Use after 20% Shift": ("Adjusted_20%", "sum"),
@@ -159,26 +215,37 @@ def run_simulation(file_bytes: bytes, efficiency_measures: bool, demand_response
         }
     ).reset_index()
 
-    grid_summary_scaled["Savings_20% (Wh)"] = grid_summary_scaled["Original Grid Use(Wh)"] - grid_summary_scaled["Grid Use after 20% Shift"]
-    grid_summary_scaled["Savings_30% (Wh)"] = grid_summary_scaled["Original Grid Use(Wh)"] - grid_summary_scaled["Grid Use after 30% Shift"]
-    grid_summary_scaled["Savings_20% (%)"] = (grid_summary_scaled["Savings_20% (Wh)"] / (grid_summary_scaled["Original Grid Use(Wh)"] + 1e-9)) * 100
-    grid_summary_scaled["Savings_30% (%)"] = (grid_summary_scaled["Savings_30% (Wh)"] / (grid_summary_scaled["Original Grid Use(Wh)"] + 1e-9)) * 100
+    grid_summary["Savings_20% (Wh)"] = grid_summary["Original Grid Use(Wh)"] - grid_summary["Grid Use after 20% Shift"]
+    grid_summary["Savings_30% (Wh)"] = grid_summary["Original Grid Use(Wh)"] - grid_summary["Grid Use after 30% Shift"]
+    grid_summary["Savings_20% (%)"] = (grid_summary["Savings_20% (Wh)"] / (grid_summary["Original Grid Use(Wh)"] + 1e-9)) * 100
+    grid_summary["Savings_30% (%)"] = (grid_summary["Savings_30% (Wh)"] / (grid_summary["Original Grid Use(Wh)"] + 1e-9)) * 100
 
-    return df_scaled, grid_summary_scaled.round(2), None
+    return df_scaled, grid_summary.round(2), None
 
 
-# -----------------------------
+
+# Session state for solar pattern tab
+
+if "cluster_raw_ts" not in st.session_state:
+    st.session_state.cluster_raw_ts = None
+if "cluster_feats" not in st.session_state:
+    st.session_state.cluster_feats = None
+
+
+
 # Tabs
-# -----------------------------
-tab1, tab2 = st.tabs(["🧠 Cluster Assignment", "⚡ Demand Response Simulation"])
+
+tab1, tab2, tab3 = st.tabs([" Cluster Assignment", " Demand Response Simulation", " Solar Patterns (by Cluster)"])
 
 
-# =============================
 # TAB 1: Cluster assignment
-# =============================
+
 with tab1:
-    st.subheader("Upload a new household CSV → get cluster pattern")
-    st.caption("Required columns: `date`, `Consumption(Wh)` (optional: `household`).")
+    st.subheader("Upload household CSV(s) → assign cluster(s)")
+    st.caption(
+        "Recommended (solar-aware model): `date`, `household`, `Consumption(Wh)`, `Production(Wh)`, `From grid(Wh)`.\n"
+        "If `household` is missing, it will be treated as one household."
+    )
 
     kmeans, scaler, feature_cols = load_artifacts()
 
@@ -193,16 +260,17 @@ with tab1:
 
         if kmeans is None:
             st.warning("Artifacts not found. Train & save the K-Means model in your notebook first.")
-            st.info("Your notebook must save: kmeans_model.pkl, scaler.pkl, feature_columns.pkl into household_clustering_model/")
 
     with colA:
-        uploaded_cluster = st.file_uploader("Upload new household CSV (for clustering)", type="csv", key="cluster_upload")
+        uploaded_cluster = st.file_uploader("Upload CSV for clustering", type="csv", key="cluster_upload")
         if uploaded_cluster is None:
-            st.info("Upload a CSV to classify a household.")
+            st.info("Upload a CSV to classify households.")
         else:
             file_bytes = uploaded_cluster.getvalue()
             if not file_bytes:
                 st.error("Uploaded file is empty (0 bytes).")
+            elif kmeans is None:
+                st.error("Model artifacts are missing — cannot assign clusters yet.")
             else:
                 df_new = pd.read_csv(BytesIO(file_bytes))
                 df_new = strip_cols(df_new)
@@ -210,77 +278,86 @@ with tab1:
                 st.markdown("#### Diagnostic: detected columns")
                 st.write(df_new.columns.tolist())
 
-                missing = require_columns(df_new, [DATE_COL, CONS_COL])
-                if missing:
-                    st.error(f"Missing required columns for clustering: {missing}")
-                elif kmeans is None:
-                    st.error("Model artifacts are missing — cannot assign clusters yet.")
-                else:
+                
+                try:
                     feats = build_features_for_clustering(df_new)
-                    X = feats.reindex(columns=[HOUSEHOLD_COL] + list(feature_cols), fill_value=0)
-                    X_mat = X[list(feature_cols)].replace([np.inf, -np.inf], np.nan).fillna(0)
+                except Exception as e:
+                    st.error(f"Feature engineering failed: {e}")
+                    st.stop()
 
-                    X_scaled = scaler.transform(X_mat)
-                    feats["cluster"] = kmeans.predict(X_scaled)
-                    feats["cluster_label"] = feats["cluster"].map(CLUSTER_LABELS).fillna(feats["cluster"].astype(str))
+                
+                for c in feature_cols:
+                    if c not in feats.columns:
+                        feats[c] = 0
 
-                    st.markdown("### Cluster assignment result")
-                    st.dataframe(feats, use_container_width=True)
+                X_new = feats[list(feature_cols)].replace([np.inf, -np.inf], np.nan).fillna(0)
+                X_new_scaled = scaler.transform(X_new)
+                preds = kmeans.predict(X_new_scaled)
 
-                    # Hourly profile plot
-                    try:
-                        df_plot = ensure_datetime(df_new, DATE_COL)
-                        df_plot = ensure_numeric_nonneg(df_plot, CONS_COL)
-                        df_plot["hour"] = pd.to_datetime(df_plot[DATE_COL]).dt.hour
-                        hourly = df_plot.groupby("hour")[CONS_COL].mean().reset_index()
+                feats["cluster"] = preds
+                feats["cluster_label"] = feats["cluster"].map(CLUSTER_LABELS).fillna(feats["cluster"].astype(str))
 
-                        fig = px.line(hourly, x="hour", y=CONS_COL, markers=True,
-                                      title="Uploaded household: average hourly consumption")
-                        fig.update_xaxes(dtick=1)
-                        st.plotly_chart(fig, use_container_width=True)
-                    except Exception:
-                        st.warning("Could not plot hourly profile (check your `date` and `Consumption(Wh)` values).")
+                st.markdown("### Cluster assignment result")
+                st.dataframe(feats, use_container_width=True)
+
+                
+                try:
+                    st.session_state.cluster_feats = feats.copy()
+                    ts = attach_cluster_to_timeseries(df_new, feats)
+                    
+                    if CONS_COL in ts.columns:
+                        ts = ensure_numeric_nonneg(ts, CONS_COL)
+                    if PROD_COL in ts.columns:
+                        ts = ensure_numeric_nonneg(ts, PROD_COL)
+                    if GRID_COL in ts.columns:
+                        ts = ensure_numeric_nonneg(ts, GRID_COL)
+                    st.session_state.cluster_raw_ts = ts
+                    st.success("Saved clustered time-series into session (Solar Patterns tab is now available).")
+                except Exception as e:
+                    st.warning(f"Could not prepare Solar Patterns tab data: {e}")
+
+                
+                try:
+                    ts_plot = st.session_state.cluster_raw_ts
+                    hourly_cons = ts_plot.groupby("hour")[CONS_COL].mean().reset_index()
+                    fig = px.line(hourly_cons, x="hour", y=CONS_COL, markers=True,
+                                  title="Uploaded data: average hourly consumption (overall)")
+                    fig.update_xaxes(dtick=1)
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    pass
 
 
-# =============================
+
 # TAB 2: Simulation
-# =============================
+
 with tab2:
-    st.subheader("Upload household grid-import data → simulate demand response savings")
-    st.caption("Required columns: `date`, `household`, `Consumption(Wh)`, `From grid(Wh)`.")
+    st.subheader("Upload grid-import data → simulate demand response savings")
+    st.caption("Required: `date`, `household`, `Consumption(Wh)`, `From grid(Wh)`.")
 
     with st.sidebar:
         st.header("Scenario controls (Simulation tab)")
         efficiency_measures = st.checkbox("Apply Energy Efficiency Measures (10% grid reduction)", value=False, key="eff")
         demand_response = st.checkbox("Enable Demand Response (peak shifting)", value=False, key="dr")
         st.divider()
-        st.caption("These controls affect only the Simulation tab.")
 
     uploaded_sim = st.file_uploader("Upload CSV (for simulation)", type="csv", key="sim_upload")
-
     if uploaded_sim is None:
         st.info("Upload a simulation CSV to run demand-response analysis.")
     else:
-        # Read bytes ONCE
         sim_bytes = uploaded_sim.getvalue()
         if not sim_bytes:
             st.error("Uploaded file is empty (0 bytes). Please re-export and upload again.")
             st.stop()
 
-        # Preview + diagnostics
         df_preview = pd.read_csv(BytesIO(sim_bytes))
         df_preview = strip_cols(df_preview)
 
         st.markdown("#### Diagnostic: detected columns")
         st.write(df_preview.columns.tolist())
-
-        st.markdown("#### Preview")
         st.dataframe(df_preview.head(50), use_container_width=True)
 
-        st.write("Uploaded file size (bytes):", len(sim_bytes))
-
-        run_btn = st.button("Run Simulation", type="primary")
-        if run_btn:
+        if st.button("Run Simulation", type="primary"):
             with st.spinner("Running simulation..."):
                 df_scaled, grid_summary_scaled, err = run_simulation(sim_bytes, efficiency_measures, demand_response)
 
@@ -292,7 +369,6 @@ with tab2:
                 col1, col2 = st.columns([2, 1])
 
                 with col1:
-                    st.markdown("### Grid usage by household")
                     fig1 = px.bar(
                         grid_summary_scaled,
                         x=HOUSEHOLD_COL,
@@ -303,7 +379,6 @@ with tab2:
                     )
                     st.plotly_chart(fig1, use_container_width=True)
 
-                    st.markdown("### Savings percentage by household")
                     fig2 = px.line(
                         grid_summary_scaled,
                         x=HOUSEHOLD_COL,
@@ -315,7 +390,6 @@ with tab2:
                     st.plotly_chart(fig2, use_container_width=True)
 
                 with col2:
-                    st.markdown("### Key metrics")
                     overall_original = grid_summary_scaled["Original Grid Use(Wh)"].sum()
                     overall_s20 = grid_summary_scaled["Savings_20% (Wh)"].sum()
                     overall_s30 = grid_summary_scaled["Savings_30% (Wh)"].sum()
@@ -324,7 +398,6 @@ with tab2:
                     st.metric("Total Savings (20%)", f"{overall_s20:.2f} Wh")
                     st.metric("Total Savings (30%)", f"{overall_s30:.2f} Wh")
 
-                    st.markdown("### Results table")
                     st.dataframe(grid_summary_scaled, use_container_width=True)
 
                     st.download_button(
@@ -335,7 +408,83 @@ with tab2:
                     )
 
                 if demand_response:
-                    st.markdown("### Demand response detail (peak/off-peak)")
-                    st.caption("Peak hours are defined as the top 25% hours by average consumption (75th percentile threshold).")
-                    df_scaled_show = df_scaled[[DATE_COL, HOUSEHOLD_COL, CONS_COL, GRID_COL, "hour", "demand_period"]].head(200)
-                    st.dataframe(df_scaled_show, use_container_width=True)
+                    st.markdown("### Demand response detail (preview)")
+                    st.dataframe(df_scaled[[DATE_COL, HOUSEHOLD_COL, CONS_COL, GRID_COL, "hour", "demand_period"]].head(200),
+                                 use_container_width=True)
+
+
+
+# TAB 3: Solar patterns per cluster
+
+with tab3:
+    st.subheader("Solar patterns by predicted cluster")
+    st.caption("First run Cluster Assignment tab (upload a CSV) to populate this dashboard.")
+
+    ts = st.session_state.cluster_raw_ts
+    feats = st.session_state.cluster_feats
+
+    if ts is None or feats is None:
+        st.info("No clustered data in session yet. Go to **Cluster Assignment** tab, upload a CSV, and classify it.")
+    else:
+        # Controls
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            metric = st.selectbox("Metric", [PROD_COL, CONS_COL, GRID_COL], index=0)
+        with c2:
+            agg = st.selectbox("Aggregation", ["mean", "sum"], index=0)
+        with c3:
+            view = st.selectbox("View", ["Hourly (diurnal)", "Monthly (seasonality)"], index=0)
+
+        
+        if metric not in ts.columns:
+            st.error(f"Metric `{metric}` not found in uploaded data. Available columns: {ts.columns.tolist()}")
+            st.stop()
+
+        
+        st.markdown("### Cluster feature profiles (uploaded batch)")
+        show_profile = feats.groupby(["cluster", "cluster_label"]).mean(numeric_only=True).round(3).reset_index()
+        st.dataframe(show_profile, use_container_width=True)
+
+        # Pattern plots
+        if view.startswith("Hourly"):
+            group_cols = ["cluster_label", "hour"]
+        else:
+            group_cols = ["cluster_label", "month"]
+
+        if agg == "mean":
+            pat = ts.groupby(group_cols)[metric].mean().reset_index()
+        else:
+            pat = ts.groupby(group_cols)[metric].sum().reset_index()
+
+        title = f"{agg.upper()} {metric} by Cluster ({'Hourly' if 'hour' in group_cols else 'Monthly'})"
+
+        if "hour" in group_cols:
+            fig = px.line(pat, x="hour", y=metric, color="cluster_label", markers=True, title=title)
+            fig.update_xaxes(dtick=1)
+        else:
+            fig = px.line(pat, x="month", y=metric, color="cluster_label", markers=True, title=title)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        
+        if (PROD_COL in ts.columns) and (CONS_COL in ts.columns):
+            st.markdown("### Solar self-consumption pattern (per cluster)")
+            tmp = ts.copy()
+            tmp[PROD_COL] = pd.to_numeric(tmp[PROD_COL], errors="coerce").fillna(0).clip(lower=0)
+            tmp[CONS_COL] = pd.to_numeric(tmp[CONS_COL], errors="coerce").fillna(0).clip(lower=0)
+            tmp["solar_used_Wh"] = np.minimum(tmp[CONS_COL], tmp[PROD_COL])
+            tmp["self_consumption_inst"] = tmp["solar_used_Wh"] / (tmp[PROD_COL] + 1e-9)
+
+            sc = tmp.groupby(["cluster_label", "hour"])["self_consumption_inst"].mean().reset_index()
+            fig_sc = px.line(sc, x="hour", y="self_consumption_inst", color="cluster_label", markers=True,
+                             title="Average self-consumption ratio by hour (per cluster)")
+            fig_sc.update_xaxes(dtick=1)
+            st.plotly_chart(fig_sc, use_container_width=True)
+
+        # Download clustered time-series
+        st.download_button(
+            "Download clustered time-series (rows tagged with cluster)",
+            data=ts.to_csv(index=False).encode("utf-8"),
+            file_name="clustered_timeseries.csv",
+            mime="text/csv",
+        )
