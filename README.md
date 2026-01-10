@@ -77,8 +77,6 @@ matplotlib / seaborn
 
 Streamlit (interactive dashboard)
 
-Jupyter Notebook
-
 📈 Key Outcomes
 
 Clear identification of household energy behaviour clusters
